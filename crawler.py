@@ -7,12 +7,13 @@ import mimetypes
 import os
 import re
 import signal
+import string
 import sys
 from collections import defaultdict
 from copy import copy
 from datetime import datetime
 from urllib.error import HTTPError
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from urllib.robotparser import RobotFileParser
@@ -226,6 +227,12 @@ class Crawler:
 
 
 	def __crawl(self, current_url):
+		# Percent-encode any non-ASCII characters (e.g. raw unicode in the path)
+		# so the request line, which http.client requires to be ASCII, doesn't
+		# raise a UnicodeEncodeError. Already-encoded/reserved/punctuation
+		# characters are left untouched, so this is a no-op for plain URLs.
+		current_url = quote(current_url, safe=string.printable)
+
 		url = urlparse(current_url)
 		logging.info(f"Crawling #{self.num_crawled}: {url.geturl()}")
 		self.num_crawled += 1
