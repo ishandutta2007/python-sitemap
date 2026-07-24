@@ -63,6 +63,9 @@ class Crawler:
 	tagstripregex = re.compile(b'<[^>]+>')
 	iframeregex = re.compile (b'<iframe [^>]*src=[\'|"](.*?)[\'"].*?>')
 	baseregex = re.compile (b'<base [^>]*href=[\'|"](.*?)[\'"].*?>')
+	metaregex = re.compile(b'<meta\\s+[^>]*>', re.IGNORECASE)
+	metanameregex = re.compile(b'name=[\'"](.*?)[\'"]', re.IGNORECASE)
+	metacontentregex = re.compile(b'content=[\'"](.*?)[\'"]', re.IGNORECASE)
 
 	rp = None
 	response_code=defaultdict(int)
@@ -76,7 +79,8 @@ class Crawler:
 	def __init__(self, num_workers=1, parserobots=False, output=None,
 				 report=False ,domain="", exclude=[], skipext=[], drop=[],
 				 debug=False, verbose=False, images=False, auth=False, as_index=False,
-				 fetch_iframes=False, sort_alphabetically=True, user_agent='*', resume=False):
+				 fetch_iframes=False, sort_alphabetically=True, user_agent='*', resume=False,
+				 respect_noindex=False):
 		self.num_workers   = num_workers
 		self.parserobots   = parserobots
 		self.user_agent    = user_agent
@@ -94,6 +98,7 @@ class Crawler:
 		self.as_index      = as_index
 		self.sort_alphabetically = sort_alphabetically
 		self.resume        = resume
+		self.respect_noindex = respect_noindex
 
 		if self.debug:
 			log_level = logging.DEBUG
@@ -265,6 +270,11 @@ class Crawler:
 			msg = "".encode( )
 			date = None
 
+		# Meta robots directives (noindex/nofollow) found on the page, if enabled
+		meta_robots_directives = set()
+		if self.respect_noindex:
+			meta_robots_directives = self.get_meta_robots_directives(msg)
+
 		# Image sitemap enabled ?
 		image_list = ""
 		if self.images:
@@ -337,15 +347,18 @@ class Crawler:
 
 		# Only add to sitemap URLs with same domain as the site being indexed
 		if url.netloc == self.target_domain:
-			# Last mod fetched ?
-			lastmod = ""
-			if date:
-				lastmod = "<lastmod>"+date.strftime('%Y-%m-%dT%H:%M:%S+00:00')+"</lastmod>"
-			# Note: that if there was a redirect, `final_url` may be different than
-			#       `current_url`, and avoid not parseable content
-			final_url = response.geturl() if response is not None else current_url
-			url_string = "<url><loc>"+self.htmlspecialchars(final_url)+"</loc>" + lastmod + image_list + "</url>"
-			self.url_strings_to_output.append(url_string)
+			if "noindex" in meta_robots_directives:
+				logging.debug(f"Skipping {current_url} from sitemap, noindex meta tag found.")
+			else:
+				# Last mod fetched ?
+				lastmod = ""
+				if date:
+					lastmod = "<lastmod>"+date.strftime('%Y-%m-%dT%H:%M:%S+00:00')+"</lastmod>"
+				# Note: that if there was a redirect, `final_url` may be different than
+				#       `current_url`, and avoid not parseable content
+				final_url = response.geturl() if response is not None else current_url
+				url_string = "<url><loc>"+self.htmlspecialchars(final_url)+"</loc>" + lastmod + image_list + "</url>"
+				self.url_strings_to_output.append(url_string)
 		# If the URL has a different domain than the site being indexed, this was reached through an iframe
   		# In this case: if the base tag matches the site being indexed, then all relative URLs should be crawled.
 		else:
@@ -362,12 +375,33 @@ class Crawler:
 			current_url = base_url
 			url = parsed_base_url
 		
+		# A nofollow meta robots directive means links found on this page should
+		# not be followed, but doesn't affect pages reached through other links
+		if "nofollow" in meta_robots_directives:
+			logging.debug(f"Not following links on {current_url}, nofollow meta tag found.")
+			return
+
 		# Found links
 		self.find_links(msg, url, current_url)
 
 		if self.fetch_iframes:
 			self.find_links(msg, url, current_url, iframes=True)
 
+
+	def get_meta_robots_directives(self, msg):
+		# Collects the comma-separated values of <meta name="robots" content="..."> tags,
+		# e.g. {"noindex", "nofollow"} for <meta name="robots" content="noindex, nofollow">
+		directives = set()
+		for meta_tag in self.metaregex.findall(msg):
+			name_match = self.metanameregex.search(meta_tag)
+			if not name_match or name_match.group(1).decode("utf-8", errors="ignore").strip().lower() != "robots":
+				continue
+			content_match = self.metacontentregex.search(meta_tag)
+			if not content_match:
+				continue
+			content = content_match.group(1).decode("utf-8", errors="ignore").lower()
+			directives.update(directive.strip() for directive in content.split(","))
+		return directives
 
 	def find_links(self, msg, url, current_url, iframes: bool = False):
 		if iframes:

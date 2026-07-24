@@ -112,6 +112,13 @@ $ python3 main.py --domain https://blog.lesite.us --auth
 $ python3 main.py --domain https://blog.lesite.us --as-index --output sitemap.xml
 ```
 
+#### Exclude pages with a noindex meta tag
+
+***Pages containing `<meta name="robots" content="noindex">` are excluded from the output sitemap. A `nofollow` directive on a page stops links found on that page from being followed, but doesn't exclude the page itself:***
+```
+$ python3 main.py --domain https://blog.lesite.us --output sitemap.xml --respect-noindex
+```
+
 #### Resume an interrupted crawl
 ***Large crawls can take a long time and may get interrupted (Ctrl+C, a crash, a network drop). Pass `--resume` to periodically save crawl progress into `--output` itself, including on interrupt, instead of a separate file. Re-running the exact same command afterwards continues from that file instead of starting over:***
 ```
