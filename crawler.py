@@ -51,7 +51,13 @@ class Crawler:
 
 	# TODO also search for window.location={.*?}
 	linkregex = re.compile(b'<a [^>]*href=[\'|"](.*?)[\'"][^>]*?>')
-	imageregex = re.compile (b'<img [^>]*src=[\'|"](.*?)[\'"].*?>')
+	imageregex = re.compile (b'<img ([^>]*)>')
+	imagesrcregex = re.compile(b'(?<!-)\\bsrc=[\'"](.*?)[\'"]', re.IGNORECASE)
+	imagealtregex = re.compile(b'(?<!-)\\balt=[\'"](.*?)[\'"]', re.IGNORECASE)
+	imagetitleregex = re.compile(b'(?<!-)\\btitle=[\'"](.*?)[\'"]', re.IGNORECASE)
+	figureregex = re.compile(b'<figure[^>]*>(.*?)</figure>', re.IGNORECASE | re.DOTALL)
+	figcaptionregex = re.compile(b'<figcaption[^>]*>(.*?)</figcaption>', re.IGNORECASE | re.DOTALL)
+	tagstripregex = re.compile(b'<[^>]+>')
 	iframeregex = re.compile (b'<iframe [^>]*src=[\'|"](.*?)[\'"].*?>')
 	baseregex = re.compile (b'<base [^>]*href=[\'|"](.*?)[\'"].*?>')
 
@@ -231,10 +237,31 @@ class Crawler:
 		# Image sitemap enabled ?
 		image_list = ""
 		if self.images:
+			# Search for <figure> blocks so a <figcaption> can be matched back
+			# to the <img> it describes, keyed by the image's raw src attribute.
+			image_captions = {}
+			for figure_content in self.figureregex.findall(msg):
+				figcaption_match = self.figcaptionregex.search(figure_content)
+				img_match = self.imageregex.search(figure_content)
+				if not figcaption_match or not img_match:
+					continue
+				src_match = self.imagesrcregex.search(img_match.group(1))
+				if not src_match:
+					continue
+				caption = self.tagstripregex.sub(b'', figcaption_match.group(1))
+				caption = caption.decode("utf-8", errors="ignore").strip()
+				if caption:
+					image_captions[src_match.group(1)] = caption
+
 			# Search for images in the current page.
 			images = self.imageregex.findall(msg)
-			for image_link in list(set(images)):
-				image_link = image_link.decode("utf-8", errors="ignore")
+			for image_attrs in list(set(images)):
+				src_match = self.imagesrcregex.search(image_attrs)
+				if not src_match:
+					continue
+
+				raw_src = src_match.group(1)
+				image_link = raw_src.decode("utf-8", errors="ignore")
 
 				# Ignore link starting with data:
 				if image_link.startswith("data:"):
@@ -258,12 +285,24 @@ class Crawler:
 				if image_link_parsed.netloc != self.target_domain:
 					continue
 
+				# Take the title from the title attribute, falling back to alt
+				title_match = self.imagetitleregex.search(image_attrs)
+				alt_match = self.imagealtregex.search(image_attrs)
+				title = ""
+				if title_match and title_match.group(1).strip():
+					title = title_match.group(1).decode("utf-8", errors="ignore").strip()
+				elif alt_match and alt_match.group(1).strip():
+					title = alt_match.group(1).decode("utf-8", errors="ignore").strip()
+
+				caption = image_captions.get(raw_src, "")
 
 				# Test if images as been already seen and not present in the
 				# robot file
 				if self.can_fetch(image_link):
 					logging.debug(f"Found image : {image_link}")
-					image_list = f"{image_list}<image:image><image:loc>{self.htmlspecialchars(image_link)}</image:loc></image:image>"
+					image_title = f"<image:title>{self.htmlspecialchars(title)}</image:title>" if title else ""
+					image_caption = f"<image:caption>{self.htmlspecialchars(caption)}</image:caption>" if caption else ""
+					image_list = f"{image_list}<image:image><image:loc>{self.htmlspecialchars(image_link)}</image:loc>{image_title}{image_caption}</image:image>"
 
 		# Only add to sitemap URLs with same domain as the site being indexed
 		if url.netloc == self.target_domain:

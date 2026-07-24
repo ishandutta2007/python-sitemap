@@ -38,6 +38,10 @@ Read a config file to set parameters:
 
 More informations here https://support.google.com/webmasters/answer/178636?hl=en
 
+When enabled, each image's `title` (falling back to `alt` if there is no `title`) is
+added as `<image:title>`, and if the image sits inside a `<figure>` with a `<figcaption>`,
+that caption is added as `<image:caption>`.
+
   ```
   $ python main.py --domain https://blog.lesite.us --output sitemap.xml --images
   ```
