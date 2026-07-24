@@ -46,6 +46,20 @@ that caption is added as `<image:caption>`.
   $ python main.py --domain https://blog.lesite.us --output sitemap.xml --images
   ```
 
+#### Enable Video Sitemap
+
+More informations here https://developers.google.com/search/docs/crawling-indexing/sitemaps/video-sitemaps
+
+When enabled, each `<video>` tag's source (either its own `src` attribute or a
+nested `<source>` tag's `src`) is added as `<video:content_loc>`. The video's
+`poster` attribute (if any) is added as `<video:thumbnail_loc>`, its `title`
+attribute as `<video:title>`, and if the video sits inside a `<figure>` with a
+`<figcaption>`, that caption is added as `<video:description>`.
+
+  ```
+  $ python main.py --domain https://blog.lesite.us --output sitemap.xml --videos
+  ```
+
 #### Allow fetching content from Iframes
 
   ```

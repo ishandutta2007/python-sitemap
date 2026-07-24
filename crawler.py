@@ -60,6 +60,9 @@ class Crawler:
 	imagetitleregex = re.compile(b'(?<!-)\\btitle=[\'"](.*?)[\'"]', re.IGNORECASE)
 	figureregex = re.compile(b'<figure[^>]*>(.*?)</figure>', re.IGNORECASE | re.DOTALL)
 	figcaptionregex = re.compile(b'<figcaption[^>]*>(.*?)</figcaption>', re.IGNORECASE | re.DOTALL)
+	videoregex = re.compile(b'<video([^>]*)>(.*?)</video>', re.IGNORECASE | re.DOTALL)
+	videosourceregex = re.compile(b'<source([^>]*)>', re.IGNORECASE)
+	videoposterregex = re.compile(b'(?<!-)\\bposter=[\'"](.*?)[\'"]', re.IGNORECASE)
 	tagstripregex = re.compile(b'<[^>]+>')
 	iframeregex = re.compile (b'<iframe [^>]*src=[\'|"](.*?)[\'"].*?>')
 	baseregex = re.compile (b'<base [^>]*href=[\'|"](.*?)[\'"].*?>')
@@ -81,7 +84,7 @@ class Crawler:
 
 	def __init__(self, num_workers=1, parserobots=False, output=None,
 				 report=False ,domain="", exclude=[], skipext=[], drop=[],
-				 debug=False, verbose=False, images=False, auth=False, as_index=False,
+				 debug=False, verbose=False, images=False, videos=False, auth=False, as_index=False,
 				 fetch_iframes=False, sort_alphabetically=True, user_agent='*', resume=False,
 				 respect_noindex=True, respect_canonical=True):
 		self.num_workers   = num_workers
@@ -96,6 +99,7 @@ class Crawler:
 		self.debug		   = debug
 		self.verbose       = verbose
 		self.images        = images
+		self.videos        = videos
 		self.fetch_iframes = fetch_iframes
 		self.auth          = auth
 		self.as_index      = as_index
@@ -306,20 +310,9 @@ class Crawler:
 					continue
 
 				raw_src = src_match.group(1)
-				image_link = raw_src.decode("utf-8", errors="ignore")
-
-				# Ignore link starting with data:
-				if image_link.startswith("data:"):
+				image_link = self.resolve_resource_url(raw_src, url)
+				if image_link is None:
 					continue
-
-				# If path start with // get the current url scheme
-				if image_link.startswith("//"):
-					image_link = url.scheme + ":" + image_link
-				# Append domain if not present
-				elif not image_link.startswith(("http", "https")):
-					if not image_link.startswith("/"):
-						image_link = f"/{image_link}"
-					image_link = f'{self.domain.strip("/")}{image_link.replace("./", "/")}'
 
 				# Ignore image if path is in the exclude_url list
 				if not self.exclude_url(image_link):
@@ -349,6 +342,69 @@ class Crawler:
 					image_caption = f"<image:caption>{self.htmlspecialchars(caption)}</image:caption>" if caption else ""
 					image_list = f"{image_list}<image:image><image:loc>{self.htmlspecialchars(image_link)}</image:loc>{image_title}{image_caption}</image:image>"
 
+		# Video sitemap enabled ?
+		video_list = ""
+		if self.videos:
+			# Search for <figure> blocks so a <figcaption> can be matched back
+			# to the <video> it describes, keyed by the video's raw src attribute.
+			video_captions = {}
+			for figure_content in self.figureregex.findall(msg):
+				figcaption_match = self.figcaptionregex.search(figure_content)
+				video_match = self.videoregex.search(figure_content)
+				if not figcaption_match or not video_match:
+					continue
+				raw_src = self.get_video_src(video_match.group(1), video_match.group(2))
+				if not raw_src:
+					continue
+				caption = self.tagstripregex.sub(b'', figcaption_match.group(1))
+				caption = caption.decode("utf-8", errors="ignore").strip()
+				if caption:
+					video_captions[raw_src] = caption
+
+			# Search for videos in the current page.
+			videos = self.videoregex.findall(msg)
+			for video_attrs, video_content in list(set(videos)):
+				raw_src = self.get_video_src(video_attrs, video_content)
+				if not raw_src:
+					continue
+
+				video_link = self.resolve_resource_url(raw_src, url)
+				if video_link is None:
+					continue
+
+				# Ignore video if path is in the exclude_url list
+				if not self.exclude_url(video_link):
+					continue
+
+				# Ignore other domain videos
+				video_link_parsed = urlparse(video_link)
+				if video_link_parsed.netloc != self.target_domain:
+					continue
+
+				# Thumbnail comes from the poster attribute, if present
+				thumbnail_link = ""
+				poster_match = self.videoposterregex.search(video_attrs)
+				if poster_match and poster_match.group(1).strip():
+					resolved_thumbnail = self.resolve_resource_url(poster_match.group(1), url)
+					if resolved_thumbnail is not None:
+						thumbnail_link = resolved_thumbnail
+
+				title_match = self.imagetitleregex.search(video_attrs)
+				title = ""
+				if title_match and title_match.group(1).strip():
+					title = title_match.group(1).decode("utf-8", errors="ignore").strip()
+
+				description = video_captions.get(raw_src, "")
+
+				# Test if videos as been already seen and not present in the
+				# robot file
+				if self.can_fetch(video_link):
+					logging.debug(f"Found video : {video_link}")
+					video_thumbnail = f"<video:thumbnail_loc>{self.htmlspecialchars(thumbnail_link)}</video:thumbnail_loc>" if thumbnail_link else ""
+					video_title = f"<video:title>{self.htmlspecialchars(title)}</video:title>" if title else ""
+					video_description = f"<video:description>{self.htmlspecialchars(description)}</video:description>" if description else ""
+					video_list = f"{video_list}<video:video><video:content_loc>{self.htmlspecialchars(video_link)}</video:content_loc>{video_thumbnail}{video_title}{video_description}</video:video>"
+
 		# Note: that if there was a redirect, `final_url` may be different than
 		#       `current_url`, and avoid not parseable content
 		final_url = response.geturl() if response is not None else current_url
@@ -369,7 +425,7 @@ class Crawler:
 				lastmod = ""
 				if date:
 					lastmod = "<lastmod>"+date.strftime('%Y-%m-%dT%H:%M:%S+00:00')+"</lastmod>"
-				url_string = "<url><loc>"+self.htmlspecialchars(final_url)+"</loc>" + lastmod + image_list + "</url>"
+				url_string = "<url><loc>"+self.htmlspecialchars(final_url)+"</loc>" + lastmod + image_list + video_list + "</url>"
 				self.url_strings_to_output.append(url_string)
 		# If the URL has a different domain than the site being indexed, this was reached through an iframe
   		# In this case: if the base tag matches the site being indexed, then all relative URLs should be crawled.
@@ -676,6 +732,40 @@ class Crawler:
 	def is_image(path):
 		mt, me = mimetypes.guess_type(path)
 		return mt is not None and mt.startswith("image/")
+
+	def resolve_resource_url(self, raw_link, url):
+		# Resolves a raw src/poster attribute value (bytes) found on the page
+		# into an absolute URL string, or None if it's a data: URI.
+		link = raw_link.decode("utf-8", errors="ignore")
+
+		if link.startswith("data:"):
+			return None
+
+		# If path start with // get the current url scheme
+		if link.startswith("//"):
+			return url.scheme + ":" + link
+		# Append domain if not present
+		elif not link.startswith(("http", "https")):
+			if not link.startswith("/"):
+				link = f"/{link}"
+			return f'{self.domain.strip("/")}{link.replace("./", "/")}'
+
+		return link
+
+	def get_video_src(self, video_attrs, video_content):
+		# A <video> tag's source can either be a src attribute directly on the
+		# tag, or a src attribute on a nested <source> tag.
+		src_match = self.imagesrcregex.search(video_attrs)
+		if src_match:
+			return src_match.group(1)
+
+		source_match = self.videosourceregex.search(video_content)
+		if source_match:
+			src_match = self.imagesrcregex.search(source_match.group(1))
+			if src_match:
+				return src_match.group(1)
+
+		return None
 
 	def exclude_link(self,link):
 		if link not in self.excluded:
