@@ -112,6 +112,12 @@ $ python3 main.py --domain https://blog.lesite.us --auth
 $ python3 main.py --domain https://blog.lesite.us --as-index --output sitemap.xml
 ```
 
+#### Resume an interrupted crawl
+***Large crawls can take a long time and may get interrupted (Ctrl+C, a crash, a network drop). Pass `--checkpoint` with a file path to periodically save crawl progress there, including on interrupt. Re-running the exact same command afterwards resumes from that file instead of starting over. The checkpoint file is removed automatically once the crawl finishes successfully:***
+```
+$ python3 main.py --domain https://blog.lesite.us --output sitemap.xml --checkpoint sitemap.checkpoint
+```
+
 ## Docker usage
 
 #### Build the Docker image:

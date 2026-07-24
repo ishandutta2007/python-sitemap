@@ -1,11 +1,14 @@
 import asyncio
 import base64
 import concurrent.futures
+import json
 import logging
 import math
 import mimetypes
 import os
 import re
+import signal
+import sys
 from collections import defaultdict
 from copy import copy
 from datetime import datetime
@@ -24,6 +27,7 @@ class IllegalArgumentError(ValueError):
 class Crawler:
 
 	MAX_URLS_PER_SITEMAP = 50000
+	CHECKPOINT_INTERVAL = 50 # Save checkpoint every N crawled pages
 
 	# Variables
 	parserobots = False
@@ -75,7 +79,7 @@ class Crawler:
 	def __init__(self, num_workers=1, parserobots=False, output=None,
 				 report=False ,domain="", exclude=[], skipext=[], drop=[],
 				 debug=False, verbose=False, images=False, auth=False, as_index=False,
-				 fetch_iframes=False, sort_alphabetically=True, user_agent='*'):
+				 fetch_iframes=False, sort_alphabetically=True, user_agent='*', checkpoint=None):
 		self.num_workers   = num_workers
 		self.parserobots   = parserobots
 		self.user_agent    = user_agent
@@ -92,6 +96,7 @@ class Crawler:
 		self.auth          = auth
 		self.as_index      = as_index
 		self.sort_alphabetically = sort_alphabetically
+		self.checkpoint    = checkpoint
 
 		if self.debug:
 			log_level = logging.DEBUG
@@ -105,6 +110,11 @@ class Crawler:
 		self.urls_to_crawl = {self.clean_link(domain)}
 		self.url_strings_to_output = []
 		self.num_crawled = 0
+		# Urls that have been popped off urls_to_crawl but haven't finished
+		# __crawl() yet. Needed so a checkpoint taken mid-crawl can re-queue
+		# them instead of losing them (they're not in urls_to_crawl anymore,
+		# but aren't fully processed either).
+		self.in_flight = set()
 
 		if num_workers <= 0:
 			raise IllegalArgumentError("Number or workers must be positive")
@@ -128,6 +138,11 @@ class Crawler:
 			exit(255)
 
 	def run(self):
+		if self.checkpoint:
+			self.load_checkpoint()
+			signal.signal(signal.SIGINT, self._handle_interrupt)
+			signal.signal(signal.SIGTERM, self._handle_interrupt)
+
 		if self.parserobots:
 			self.check_robots()
 
@@ -137,22 +152,34 @@ class Crawler:
 			while len(self.urls_to_crawl) != 0:
 				current_url = self.urls_to_crawl.pop()
 				self.crawled_or_crawling.add(current_url)
+				self.in_flight.add(current_url)
 				self.__crawl(current_url)
+				self.in_flight.discard(current_url)
+				if self.checkpoint and self.num_crawled % self.CHECKPOINT_INTERVAL == 0:
+					self.save_checkpoint()
 		else:
 			event_loop = asyncio.get_event_loop()
 			try:
 				while len(self.urls_to_crawl) != 0:
 					executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.num_workers)
 					event_loop.run_until_complete(self.crawl_all_pending_urls(executor))
+					if self.checkpoint:
+						self.save_checkpoint()
 			finally:
 				event_loop.close()
 
 		logging.info("Crawling has reached end of all found links")
 
+		if self.checkpoint:
+			self.dedupe_url_strings_to_output()
+
 		if self.sort_alphabetically:
 			self.url_strings_to_output.sort()
 
 		self.write_sitemap_output()
+
+		if self.checkpoint:
+			self.delete_checkpoint()
 
 
 
@@ -169,7 +196,9 @@ class Crawler:
 		self.urls_to_crawl.clear()
 		for url in urls_to_crawl:
 			self.crawled_or_crawling.add(url)
+			self.in_flight.add(url)
 			task = event_loop.run_in_executor(executor, self.__crawl, url)
+			task.add_done_callback(lambda t, u=url: self.in_flight.discard(u))
 			crawl_tasks.append(task)
 
 		logging.debug('waiting on all crawl tasks to complete')
@@ -409,6 +438,98 @@ class Crawler:
 				continue
 
 			self.urls_to_crawl.add(link)
+
+	def _handle_interrupt(self, signum, frame):
+		logging.error("Interrupted, saving checkpoint before exit...")
+		self.save_checkpoint()
+		sys.exit(1)
+
+	def save_checkpoint(self):
+		if not self.checkpoint:
+			return
+		# Urls still in_flight when the checkpoint is taken haven't finished
+		# __crawl(): their own outgoing links may not be discovered yet, so
+		# treat them as pending rather than done, or a resumed crawl would
+		# silently stop short of the rest of the site.
+		pending_urls = self.urls_to_crawl | self.in_flight
+		completed_urls = self.crawled_or_crawling - self.in_flight
+		state = {
+			"domain": self.domain,
+			"urls_to_crawl": list(pending_urls),
+			"crawled_or_crawling": list(completed_urls),
+			"excluded": list(self.excluded),
+			"url_strings_to_output": self.url_strings_to_output,
+			"nb_url": self.nb_url,
+			"nb_rp": self.nb_rp,
+			"nb_exclude": self.nb_exclude,
+			"num_crawled": self.num_crawled,
+			"response_code": dict(self.response_code),
+			"marked": {str(code): urls for code, urls in self.marked.items()},
+		}
+		try:
+			with open(self.checkpoint, 'w') as checkpoint_file:
+				json.dump(state, checkpoint_file)
+			logging.debug(f"Saved checkpoint to {self.checkpoint}")
+		except Exception as e:
+			logging.error(f"Could not save checkpoint to {self.checkpoint}: {e}")
+
+	def load_checkpoint(self):
+		if not os.path.exists(self.checkpoint):
+			return
+		try:
+			with open(self.checkpoint, 'r') as checkpoint_file:
+				state = json.load(checkpoint_file)
+		except Exception as e:
+			logging.error(f"Could not read checkpoint {self.checkpoint}, starting fresh: {e}")
+			return
+
+		if state.get("domain") != self.domain:
+			logging.error(
+				f"Checkpoint {self.checkpoint} was made for domain {state.get('domain')}, "
+				f"not {self.domain}. Ignoring checkpoint and starting fresh."
+			)
+			return
+
+		self.urls_to_crawl = set(state.get("urls_to_crawl", []))
+		self.crawled_or_crawling = set(state.get("crawled_or_crawling", []))
+		self.excluded = set(state.get("excluded", []))
+		self.url_strings_to_output = state.get("url_strings_to_output", [])
+		self.nb_url = state.get("nb_url", self.nb_url)
+		self.nb_rp = state.get("nb_rp", self.nb_rp)
+		self.nb_exclude = state.get("nb_exclude", self.nb_exclude)
+		self.num_crawled = state.get("num_crawled", 0)
+		for code, count in state.get("response_code", {}).items():
+			self.response_code[int(code)] = count
+		for code, urls in state.get("marked", {}).items():
+			self.marked[int(code)] = urls
+
+		logging.info(
+			f"Resumed from checkpoint {self.checkpoint}: "
+			f"{len(self.crawled_or_crawling)} url(s) already crawled, "
+			f"{len(self.urls_to_crawl)} pending"
+		)
+
+	def delete_checkpoint(self):
+		if os.path.exists(self.checkpoint):
+			try:
+				os.remove(self.checkpoint)
+			except Exception as e:
+				logging.error(f"Could not remove checkpoint file {self.checkpoint}: {e}")
+
+	def dedupe_url_strings_to_output(self):
+		# A resumed crawl re-crawls urls that were in_flight when the
+		# checkpoint was saved, which can add a second <url> entry for a page
+		# that had already been written to url_strings_to_output. Keep the
+		# most recent entry for each loc.
+		locs_seen = {}
+		order = []
+		for url_string in self.url_strings_to_output:
+			loc_match = re.search('<loc>(.*?)</loc>', url_string)
+			key = loc_match.group(1) if loc_match else url_string
+			if key not in locs_seen:
+				order.append(key)
+			locs_seen[key] = url_string
+		self.url_strings_to_output = [locs_seen[key] for key in order]
 
 	def write_sitemap_output(self):
 		are_multiple_sitemap_files_required = \
