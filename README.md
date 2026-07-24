@@ -112,11 +112,11 @@ $ python3 main.py --domain https://blog.lesite.us --auth
 $ python3 main.py --domain https://blog.lesite.us --as-index --output sitemap.xml
 ```
 
-#### Exclude pages with a noindex meta tag
+#### Noindex / nofollow meta tags
 
-***Pages containing `<meta name="robots" content="noindex">` are excluded from the output sitemap. A `nofollow` directive on a page stops links found on that page from being followed, but doesn't exclude the page itself:***
+***By default, pages containing `<meta name="robots" content="noindex">` are excluded from the output sitemap (a `nofollow` directive on a page stops links found on that page from being followed, but doesn't exclude the page itself). Pass `--no-respect-noindex` to include noindex pages in the sitemap anyway:***
 ```
-$ python3 main.py --domain https://blog.lesite.us --output sitemap.xml --respect-noindex
+$ python3 main.py --domain https://blog.lesite.us --output sitemap.xml --no-respect-noindex
 ```
 
 #### Resume an interrupted crawl
