@@ -159,6 +159,16 @@ $ python3 main.py --domain https://blog.lesite.us --output sitemap.xml --no-resp
 $ python3 main.py --domain https://blog.lesite.us --output sitemap.xml --resume
 ```
 
+#### Client-side rendered pages (SPAs: React/Vue/Svelte…)
+
+***By default the crawler only reads the raw HTML returned by the server, so links that are only added by client-side JavaScript are invisible to it. Pass `--render-js` to instead load each page in headless Chromium (via [Playwright](https://playwright.dev/python/)) and parse the fully-rendered HTML. This is slower and forces `--num-workers` to 1 (Playwright isn't safe to drive from multiple worker threads), so only enable it for sites that actually need it:***
+```
+$ python3 main.py --domain https://blog.lesite.us --output sitemap.xml --render-js
+```
+`--render-js` requires Playwright and a Chromium build, which are **not** part of the base install. Either:
+- run via the `Dockerfile.playwright` image (see Docker usage below), which already has both, or
+- install them locally: `pip install playwright && playwright install chromium`
+
 ## Docker usage
 
 #### Build the Docker image:
@@ -184,4 +194,13 @@ $ python3 main.py --domain https://blog.lesite.us --output sitemap.xml --resume
 
   ```
   $ docker run -it -v `pwd`/config/:/config/ -v `pwd`:/home/python-sitemap/ python-sitemap --config config/config.json
+  ```
+
+#### Run with `--render-js` (Playwright + Chromium preinstalled)
+
+The default image doesn't include Playwright/Chromium to keep it small. Use `Dockerfile.playwright` instead, which is based on the official Playwright image and has both preinstalled:
+
+  ```
+  $ docker build -f Dockerfile.playwright -t python-sitemap-playwright:latest .
+  $ docker run -it python-sitemap-playwright --domain https://www.graylog.fr --render-js
   ```
