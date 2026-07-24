@@ -21,6 +21,7 @@ parser.add_argument('--report', action="store_true", default=False, required=Fal
 parser.add_argument('--images', action="store_true", default=False, required=False, help="Add image to sitemap.xml (see https://support.google.com/webmasters/answer/178636?hl=en)")
 parser.add_argument('--fetch-iframes', action="store_true", default=False, required=False, help="Fetch iframes' content when generating sitemap")
 parser.add_argument('--resume', action="store_true", default=False, required=False, help="Resume an interrupted crawl by reading already-crawled urls back out of --output, skipping them, and periodically saving progress there again (also on interrupt) so it can be resumed again if needed.")
+parser.add_argument('--no-respect-noindex', action="store_false", default=True, required=False, dest='respect_noindex', help="Include pages containing a <meta name=\"robots\" content=\"noindex\"> tag in the output sitemap instead of excluding them.")
 
 group = parser.add_mutually_exclusive_group()
 group.add_argument('--config', action="store", default=None, help="Configuration file in json format")
