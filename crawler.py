@@ -24,6 +24,30 @@ import config
 class IllegalArgumentError(ValueError):
 	pass
 
+
+class _RenderedResponse:
+	# Mimics the subset of urllib's response object that __crawl() reads,
+	# so a Playwright-rendered page can be handled by the same code path
+	# as a plain urlopen() response.
+	def __init__(self, content, status, headers, final_url):
+		self._content = content
+		self._status = status
+		self.headers = headers
+		self._final_url = final_url
+
+	def read(self):
+		return self._content
+
+	def getcode(self):
+		return self._status
+
+	def geturl(self):
+		return self._final_url
+
+	def close(self):
+		pass
+
+
 class Crawler:
 
 	MAX_URLS_PER_SITEMAP = 50000
@@ -77,6 +101,7 @@ class Crawler:
 
 	rp = None
 	response_code=defaultdict(int)
+	network_errors=defaultdict(int)
 	nb_url=1 # Number of url.
 	nb_rp=0 # Number of url blocked by the robots.txt
 	nb_exclude=0 # Number of url excluded by extension or word
@@ -88,7 +113,7 @@ class Crawler:
 				 report=False ,domain="", exclude=[], skipext=[], drop=[],
 				 debug=False, verbose=False, images=False, videos=False, auth=False, as_index=False,
 				 fetch_iframes=False, sort_alphabetically=True, user_agent='*', resume=False,
-				 respect_noindex=True, respect_canonical=True, hreflang=True):
+				 respect_noindex=True, respect_canonical=True, hreflang=True, render_js=False):
 		self.num_workers   = num_workers
 		self.parserobots   = parserobots
 		self.user_agent    = user_agent
@@ -110,6 +135,9 @@ class Crawler:
 		self.respect_noindex = respect_noindex
 		self.respect_canonical = respect_canonical
 		self.hreflang      = hreflang
+		self.render_js     = render_js
+		self.browser       = None
+		self.playwright    = None
 
 		if self.debug:
 			log_level = logging.DEBUG
@@ -120,9 +148,14 @@ class Crawler:
 
 		logging.basicConfig(level=log_level)
 
+		if self.render_js and self.num_workers > 1:
+			logging.error("--render-js only supports a single worker, forcing --num-workers to 1.")
+			self.num_workers = 1
+
 		self.urls_to_crawl = {self.clean_link(domain)}
 		self.url_strings_to_output = []
 		self.num_crawled = 0
+		self.network_errors = defaultdict(int)
 		# Urls that have been popped off urls_to_crawl but haven't finished
 		# __crawl() yet. Needed so progress saved mid-crawl can re-queue them
 		# instead of losing them (they're not in urls_to_crawl anymore, but
@@ -167,27 +200,34 @@ class Crawler:
 		if self.parserobots:
 			self.check_robots()
 
+		if self.render_js:
+			self.start_browser()
+
 		logging.info("Start the crawling process")
 
-		if self.num_workers == 1:
-			while len(self.urls_to_crawl) != 0:
-				current_url = self.urls_to_crawl.pop()
-				self.crawled_or_crawling.add(current_url)
-				self.in_flight.add(current_url)
-				self.__crawl(current_url)
-				self.in_flight.discard(current_url)
-				if self.resume and self.num_crawled % self.PROGRESS_SAVE_INTERVAL == 0:
-					self.write_progress_to_output()
-		else:
-			event_loop = asyncio.get_event_loop()
-			try:
+		try:
+			if self.num_workers == 1:
 				while len(self.urls_to_crawl) != 0:
-					executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.num_workers)
-					event_loop.run_until_complete(self.crawl_all_pending_urls(executor))
-					if self.resume:
+					current_url = self.urls_to_crawl.pop()
+					self.crawled_or_crawling.add(current_url)
+					self.in_flight.add(current_url)
+					self.__crawl(current_url)
+					self.in_flight.discard(current_url)
+					if self.resume and self.num_crawled % self.PROGRESS_SAVE_INTERVAL == 0:
 						self.write_progress_to_output()
-			finally:
-				event_loop.close()
+			else:
+				event_loop = asyncio.get_event_loop()
+				try:
+					while len(self.urls_to_crawl) != 0:
+						executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.num_workers)
+						event_loop.run_until_complete(self.crawl_all_pending_urls(executor))
+						if self.resume:
+							self.write_progress_to_output()
+				finally:
+					event_loop.close()
+		finally:
+			if self.render_js:
+				self.stop_browser()
 
 		logging.info("Crawling has reached end of all found links")
 
@@ -198,6 +238,48 @@ class Crawler:
 			self.url_strings_to_output.sort()
 
 		self.write_sitemap_output()
+
+	def start_browser(self):
+		# Playwright is an optional dependency, only required when --render-js
+		# is used, so the default (stdlib-only) install path stays untouched.
+		try:
+			from playwright.sync_api import sync_playwright
+		except ImportError:
+			logging.error(
+				"--render-js requires Playwright, which isn't installed. "
+				"Install it with `pip install playwright && playwright install chromium`, "
+				"or use the Dockerfile.playwright image instead."
+			)
+			exit(255)
+
+		self.playwright = sync_playwright().start()
+		self.browser = self.playwright.chromium.launch(headless=True)
+
+	def stop_browser(self):
+		if self.browser is not None:
+			self.browser.close()
+			self.browser = None
+		if self.playwright is not None:
+			self.playwright.stop()
+			self.playwright = None
+
+	def _fetch_rendered(self, current_url):
+		# Loads current_url in headless Chromium, waits for JS-driven
+		# rendering to settle, and returns a shim exposing just the subset of
+		# urllib's response interface __crawl() relies on (read/getcode/
+		# headers/geturl/close), so the rest of __crawl() doesn't need to
+		# fork its logic based on which fetch path produced the response.
+		page = self.browser.new_page()
+		try:
+			nav_response = page.goto(current_url, wait_until="networkidle")
+			content = page.content().encode("utf-8")
+			status = nav_response.status if nav_response is not None else 200
+			headers = nav_response.headers if nav_response is not None else {}
+			final_url = page.url
+		finally:
+			page.close()
+
+		return _RenderedResponse(content, status, headers, final_url)
 
 
 
@@ -247,7 +329,7 @@ class Crawler:
 		# Its avoid dowloading file like pdf… etc
 		if not url.path.endswith(self.not_parseable_resources):
 			try:
-				response = urlopen(request)
+				response = self._fetch_rendered(current_url) if self.render_js else urlopen(request)
 			except Exception as e:
 				if hasattr(e,'code'):
 					self.response_code[e.code] += 1
@@ -256,7 +338,15 @@ class Crawler:
 					if self.report:
 						self.marked[e.code].append(current_url)
 
-				logging.debug (f"{e} ==> {current_url}")
+					logging.debug (f"{e} ==> {current_url}")
+				else:
+					# Connection-level failures (SSL errors, DNS/timeouts, resets…)
+					# have no HTTP status code, so unlike the branch above they're
+					# never otherwise counted or reported. Surface them at ERROR
+					# level (visible without --debug) since they can otherwise
+					# silently empty an entire crawl with no explanation.
+					self.network_errors[str(e)] += 1
+					logging.error(f"Failed to fetch {current_url}: {e}")
 				return
 		else:
 			logging.debug(f"Ignore {current_url} content might be not parseable.")
@@ -269,18 +359,24 @@ class Crawler:
 				self.response_code[response.getcode()] += 1
 
 				response.close()
-
-				# Get the last modify date
-				if 'last-modified' in response.headers:
-					date = response.headers['Last-Modified']
-				else:
-					date = response.headers['Date']
-
-				date = datetime.strptime(date, '%a, %d %b %Y %H:%M:%S %Z')
-
 			except Exception as e:
-				logging.debug (f"{e} ===> {current_url}")
+				logging.error(f"Failed to read response for {current_url}: {e}")
 				return
+
+			# Get the last modify date, if any. This is purely cosmetic
+			# (populates <lastmod>), so a missing/unparseable date header
+			# must not drop the whole page from the sitemap.
+			date = None
+			try:
+				if 'last-modified' in response.headers:
+					date = response.headers['last-modified']
+				elif 'date' in response.headers:
+					date = response.headers['date']
+				if date:
+					date = datetime.strptime(date, '%a, %d %b %Y %H:%M:%S %Z')
+			except Exception as e:
+				logging.debug(f"Could not parse date header for {current_url}: {e}")
+				date = None
 		else:
 			# Response is None, content not downloaded, just continu and add
 			# the link to the sitemap
@@ -876,6 +972,9 @@ class Crawler:
 
 		for code in self.response_code:
 			print ("Nb Code HTTP {0} : {1}".format(code, self.response_code[code]))
+
+		for error in self.network_errors:
+			print ("Network error \"{0}\" : {1}".format(error, self.network_errors[error]))
 
 		for code in self.marked:
 			print ("Link with status {0}:".format(code))
