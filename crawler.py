@@ -66,6 +66,9 @@ class Crawler:
 	metaregex = re.compile(b'<meta\\s+[^>]*>', re.IGNORECASE)
 	metanameregex = re.compile(b'name=[\'"](.*?)[\'"]', re.IGNORECASE)
 	metacontentregex = re.compile(b'content=[\'"](.*?)[\'"]', re.IGNORECASE)
+	linktagregex = re.compile(b'<link\\s+[^>]*>', re.IGNORECASE)
+	linkrelregex = re.compile(b'rel=[\'"](.*?)[\'"]', re.IGNORECASE)
+	linkhrefregex = re.compile(b'href=[\'"](.*?)[\'"]', re.IGNORECASE)
 
 	rp = None
 	response_code=defaultdict(int)
@@ -80,7 +83,7 @@ class Crawler:
 				 report=False ,domain="", exclude=[], skipext=[], drop=[],
 				 debug=False, verbose=False, images=False, auth=False, as_index=False,
 				 fetch_iframes=False, sort_alphabetically=True, user_agent='*', resume=False,
-				 respect_noindex=True):
+				 respect_noindex=True, respect_canonical=True):
 		self.num_workers   = num_workers
 		self.parserobots   = parserobots
 		self.user_agent    = user_agent
@@ -99,6 +102,7 @@ class Crawler:
 		self.sort_alphabetically = sort_alphabetically
 		self.resume        = resume
 		self.respect_noindex = respect_noindex
+		self.respect_canonical = respect_canonical
 
 		if self.debug:
 			log_level = logging.DEBUG
@@ -345,18 +349,26 @@ class Crawler:
 					image_caption = f"<image:caption>{self.htmlspecialchars(caption)}</image:caption>" if caption else ""
 					image_list = f"{image_list}<image:image><image:loc>{self.htmlspecialchars(image_link)}</image:loc>{image_title}{image_caption}</image:image>"
 
+		# Note: that if there was a redirect, `final_url` may be different than
+		#       `current_url`, and avoid not parseable content
+		final_url = response.geturl() if response is not None else current_url
+
+		# A canonical tag pointing to a different URL means this page is not the
+		# canonical version, so it shouldn't be indexed under its own URL
+		canonical_url = self.get_canonical_url(msg, final_url) if self.respect_canonical else None
+		is_canonicalized_elsewhere = canonical_url is not None and self.clean_link(canonical_url) != self.clean_link(final_url)
+
 		# Only add to sitemap URLs with same domain as the site being indexed
 		if url.netloc == self.target_domain:
 			if "noindex" in meta_robots_directives:
 				logging.debug(f"Skipping {current_url} from sitemap, noindex meta tag found.")
+			elif is_canonicalized_elsewhere:
+				logging.debug(f"Skipping {current_url} from sitemap, canonical tag points to {canonical_url}.")
 			else:
 				# Last mod fetched ?
 				lastmod = ""
 				if date:
 					lastmod = "<lastmod>"+date.strftime('%Y-%m-%dT%H:%M:%S+00:00')+"</lastmod>"
-				# Note: that if there was a redirect, `final_url` may be different than
-				#       `current_url`, and avoid not parseable content
-				final_url = response.geturl() if response is not None else current_url
 				url_string = "<url><loc>"+self.htmlspecialchars(final_url)+"</loc>" + lastmod + image_list + "</url>"
 				self.url_strings_to_output.append(url_string)
 		# If the URL has a different domain than the site being indexed, this was reached through an iframe
@@ -402,6 +414,22 @@ class Crawler:
 			content = content_match.group(1).decode("utf-8", errors="ignore").lower()
 			directives.update(directive.strip() for directive in content.split(","))
 		return directives
+
+	def get_canonical_url(self, msg, base_url):
+		# Returns the absolute URL from <link rel="canonical" href="..."> on the
+		# page, if any, resolved against base_url in case href is relative.
+		for link_tag in self.linktagregex.findall(msg):
+			rel_match = self.linkrelregex.search(link_tag)
+			if not rel_match or rel_match.group(1).decode("utf-8", errors="ignore").strip().lower() != "canonical":
+				continue
+			href_match = self.linkhrefregex.search(link_tag)
+			if not href_match:
+				continue
+			href = href_match.group(1).decode("utf-8", errors="ignore").strip()
+			if not href:
+				continue
+			return urljoin(base_url, href)
+		return None
 
 	def find_links(self, msg, url, current_url, iframes: bool = False):
 		if iframes:

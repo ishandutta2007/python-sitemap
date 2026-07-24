@@ -119,6 +119,13 @@ $ python3 main.py --domain https://blog.lesite.us --as-index --output sitemap.xm
 $ python3 main.py --domain https://blog.lesite.us --output sitemap.xml --no-respect-noindex
 ```
 
+#### Canonical tags
+
+***By default, pages whose `<link rel="canonical" href="...">` tag points to a different URL are excluded from the output sitemap, since the canonical page is the one that should be indexed. Pass `--no-respect-canonical` to include canonicalized pages in the sitemap anyway:***
+```
+$ python3 main.py --domain https://blog.lesite.us --output sitemap.xml --no-respect-canonical
+```
+
 #### Resume an interrupted crawl
 ***Large crawls can take a long time and may get interrupted (Ctrl+C, a crash, a network drop). Pass `--resume` to periodically save crawl progress into `--output` itself, including on interrupt, instead of a separate file. Re-running the exact same command afterwards continues from that file instead of starting over:***
 ```
