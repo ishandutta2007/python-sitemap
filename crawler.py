@@ -72,6 +72,7 @@ class Crawler:
 	linktagregex = re.compile(b'<link\\s+[^>]*>', re.IGNORECASE)
 	linkrelregex = re.compile(b'rel=[\'"](.*?)[\'"]', re.IGNORECASE)
 	linkhrefregex = re.compile(b'href=[\'"](.*?)[\'"]', re.IGNORECASE)
+	linkhreflangregex = re.compile(b'hreflang=[\'"](.*?)[\'"]', re.IGNORECASE)
 
 	rp = None
 	response_code=defaultdict(int)
@@ -86,7 +87,7 @@ class Crawler:
 				 report=False ,domain="", exclude=[], skipext=[], drop=[],
 				 debug=False, verbose=False, images=False, videos=False, auth=False, as_index=False,
 				 fetch_iframes=False, sort_alphabetically=True, user_agent='*', resume=False,
-				 respect_noindex=True, respect_canonical=True):
+				 respect_noindex=True, respect_canonical=True, hreflang=True):
 		self.num_workers   = num_workers
 		self.parserobots   = parserobots
 		self.user_agent    = user_agent
@@ -107,6 +108,7 @@ class Crawler:
 		self.resume        = resume
 		self.respect_noindex = respect_noindex
 		self.respect_canonical = respect_canonical
+		self.hreflang      = hreflang
 
 		if self.debug:
 			log_level = logging.DEBUG
@@ -409,6 +411,12 @@ class Crawler:
 		#       `current_url`, and avoid not parseable content
 		final_url = response.geturl() if response is not None else current_url
 
+		# Hreflang sitemap enabled ?
+		hreflang_list = ""
+		if self.hreflang:
+			for hreflang, alternate_link in self.get_hreflang_links(msg, final_url):
+				hreflang_list = f'{hreflang_list}<xhtml:link rel="alternate" hreflang="{self.htmlspecialchars(hreflang)}" href="{self.htmlspecialchars(alternate_link)}"/>'
+
 		# A canonical tag pointing to a different URL means this page is not the
 		# canonical version, so it shouldn't be indexed under its own URL
 		canonical_url = self.get_canonical_url(msg, final_url) if self.respect_canonical else None
@@ -425,7 +433,7 @@ class Crawler:
 				lastmod = ""
 				if date:
 					lastmod = "<lastmod>"+date.strftime('%Y-%m-%dT%H:%M:%S+00:00')+"</lastmod>"
-				url_string = "<url><loc>"+self.htmlspecialchars(final_url)+"</loc>" + lastmod + image_list + video_list + "</url>"
+				url_string = "<url><loc>"+self.htmlspecialchars(final_url)+"</loc>" + lastmod + image_list + video_list + hreflang_list + "</url>"
 				self.url_strings_to_output.append(url_string)
 		# If the URL has a different domain than the site being indexed, this was reached through an iframe
   		# In this case: if the base tag matches the site being indexed, then all relative URLs should be crawled.
@@ -486,6 +494,30 @@ class Crawler:
 				continue
 			return urljoin(base_url, href)
 		return None
+
+	def get_hreflang_links(self, msg, base_url):
+		# Returns a list of (hreflang, absolute_url) tuples read from
+		# <link rel="alternate" hreflang="..." href="..."> tags on the page,
+		# with href resolved against base_url in case it's relative.
+		hreflang_links = []
+		for link_tag in self.linktagregex.findall(msg):
+			rel_match = self.linkrelregex.search(link_tag)
+			if not rel_match or rel_match.group(1).decode("utf-8", errors="ignore").strip().lower() != "alternate":
+				continue
+			hreflang_match = self.linkhreflangregex.search(link_tag)
+			if not hreflang_match:
+				continue
+			hreflang = hreflang_match.group(1).decode("utf-8", errors="ignore").strip()
+			if not hreflang:
+				continue
+			href_match = self.linkhrefregex.search(link_tag)
+			if not href_match:
+				continue
+			href = href_match.group(1).decode("utf-8", errors="ignore").strip()
+			if not href:
+				continue
+			hreflang_links.append((hreflang, urljoin(base_url, href)))
+		return hreflang_links
 
 	def find_links(self, msg, url, current_url, iframes: bool = False):
 		if iframes:

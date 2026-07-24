@@ -60,6 +60,19 @@ attribute as `<video:title>`, and if the video sits inside a `<figure>` with a
   $ python main.py --domain https://blog.lesite.us --output sitemap.xml --videos
   ```
 
+#### Hreflang alternate links
+
+More informations here https://developers.google.com/search/docs/specialty/international/localized-versions#sitemap
+
+***By default, each `<link rel="alternate" hreflang="..." href="...">` tag found in a
+page's `<head>` is added to that page's sitemap entry as an `<xhtml:link>` alternate,
+so search engines can discover the page's localized versions. Pass `--no-hreflang` to
+disable this:***
+
+  ```
+  $ python main.py --domain https://blog.lesite.us --output sitemap.xml --no-hreflang
+  ```
+
 #### Allow fetching content from Iframes
 
   ```
