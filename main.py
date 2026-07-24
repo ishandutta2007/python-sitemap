@@ -20,6 +20,7 @@ parser.add_argument('--drop', action="append", default=[], required=False, help=
 parser.add_argument('--report', action="store_true", default=False, required=False, help="Display a report")
 parser.add_argument('--images', action="store_true", default=False, required=False, help="Add image to sitemap.xml (see https://support.google.com/webmasters/answer/178636?hl=en)")
 parser.add_argument('--fetch-iframes', action="store_true", default=False, required=False, help="Fetch iframes' content when generating sitemap")
+parser.add_argument('--resume', action="store_true", default=False, required=False, help="Resume an interrupted crawl by reading already-crawled urls back out of --output, skipping them, and periodically saving progress there again (also on interrupt) so it can be resumed again if needed.")
 
 group = parser.add_mutually_exclusive_group()
 group.add_argument('--config', action="store", default=None, help="Configuration file in json format")

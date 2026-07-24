@@ -6,6 +6,8 @@ import math
 import mimetypes
 import os
 import re
+import signal
+import sys
 from collections import defaultdict
 from copy import copy
 from datetime import datetime
@@ -24,6 +26,7 @@ class IllegalArgumentError(ValueError):
 class Crawler:
 
 	MAX_URLS_PER_SITEMAP = 50000
+	PROGRESS_SAVE_INTERVAL = 50 # Save progress to the output file every N crawled pages
 
 	# Variables
 	parserobots = False
@@ -51,7 +54,13 @@ class Crawler:
 
 	# TODO also search for window.location={.*?}
 	linkregex = re.compile(b'<a [^>]*href=[\'|"](.*?)[\'"][^>]*?>')
-	imageregex = re.compile (b'<img [^>]*src=[\'|"](.*?)[\'"].*?>')
+	imageregex = re.compile (b'<img ([^>]*)>')
+	imagesrcregex = re.compile(b'(?<!-)\\bsrc=[\'"](.*?)[\'"]', re.IGNORECASE)
+	imagealtregex = re.compile(b'(?<!-)\\balt=[\'"](.*?)[\'"]', re.IGNORECASE)
+	imagetitleregex = re.compile(b'(?<!-)\\btitle=[\'"](.*?)[\'"]', re.IGNORECASE)
+	figureregex = re.compile(b'<figure[^>]*>(.*?)</figure>', re.IGNORECASE | re.DOTALL)
+	figcaptionregex = re.compile(b'<figcaption[^>]*>(.*?)</figcaption>', re.IGNORECASE | re.DOTALL)
+	tagstripregex = re.compile(b'<[^>]+>')
 	iframeregex = re.compile (b'<iframe [^>]*src=[\'|"](.*?)[\'"].*?>')
 	baseregex = re.compile (b'<base [^>]*href=[\'|"](.*?)[\'"].*?>')
 
@@ -61,15 +70,13 @@ class Crawler:
 	nb_rp=0 # Number of url blocked by the robots.txt
 	nb_exclude=0 # Number of url excluded by extension or word
 
-	output_file = None
-
 	target_domain = ""
 	scheme		  = ""
 
 	def __init__(self, num_workers=1, parserobots=False, output=None,
 				 report=False ,domain="", exclude=[], skipext=[], drop=[],
 				 debug=False, verbose=False, images=False, auth=False, as_index=False,
-				 fetch_iframes=False, sort_alphabetically=True, user_agent='*'):
+				 fetch_iframes=False, sort_alphabetically=True, user_agent='*', resume=False):
 		self.num_workers   = num_workers
 		self.parserobots   = parserobots
 		self.user_agent    = user_agent
@@ -86,6 +93,7 @@ class Crawler:
 		self.auth          = auth
 		self.as_index      = as_index
 		self.sort_alphabetically = sort_alphabetically
+		self.resume        = resume
 
 		if self.debug:
 			log_level = logging.DEBUG
@@ -99,6 +107,11 @@ class Crawler:
 		self.urls_to_crawl = {self.clean_link(domain)}
 		self.url_strings_to_output = []
 		self.num_crawled = 0
+		# Urls that have been popped off urls_to_crawl but haven't finished
+		# __crawl() yet. Needed so progress saved mid-crawl can re-queue them
+		# instead of losing them (they're not in urls_to_crawl anymore, but
+		# aren't fully processed either).
+		self.in_flight = set()
 
 		if num_workers <= 0:
 			raise IllegalArgumentError("Number or workers must be positive")
@@ -113,15 +126,28 @@ class Crawler:
 
 		if self.output:
 			try:
-				self.output_file = open(self.output, 'w')
+				# Resuming reads previously crawled urls out of this same file
+				# below, so don't truncate it here; every later write (progress
+				# saves and the final sitemap) opens the file in 'w' mode itself.
+				open_mode = 'a' if self.resume else 'w'
+				with open(self.output, open_mode):
+					pass
 			except:
 				logging.error ("Output file not available.")
 				exit(255)
 		elif self.as_index:
 			logging.error("When specifying an index file as an output option, you must include an output file name")
 			exit(255)
+		elif self.resume:
+			logging.error("When resuming a crawl, you must include an output file name")
+			exit(255)
 
 	def run(self):
+		if self.resume:
+			self.load_progress_from_output()
+			signal.signal(signal.SIGINT, self._handle_interrupt)
+			signal.signal(signal.SIGTERM, self._handle_interrupt)
+
 		if self.parserobots:
 			self.check_robots()
 
@@ -131,17 +157,26 @@ class Crawler:
 			while len(self.urls_to_crawl) != 0:
 				current_url = self.urls_to_crawl.pop()
 				self.crawled_or_crawling.add(current_url)
+				self.in_flight.add(current_url)
 				self.__crawl(current_url)
+				self.in_flight.discard(current_url)
+				if self.resume and self.num_crawled % self.PROGRESS_SAVE_INTERVAL == 0:
+					self.write_progress_to_output()
 		else:
 			event_loop = asyncio.get_event_loop()
 			try:
 				while len(self.urls_to_crawl) != 0:
 					executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.num_workers)
 					event_loop.run_until_complete(self.crawl_all_pending_urls(executor))
+					if self.resume:
+						self.write_progress_to_output()
 			finally:
 				event_loop.close()
 
 		logging.info("Crawling has reached end of all found links")
+
+		if self.resume:
+			self.dedupe_url_strings_to_output()
 
 		if self.sort_alphabetically:
 			self.url_strings_to_output.sort()
@@ -163,7 +198,9 @@ class Crawler:
 		self.urls_to_crawl.clear()
 		for url in urls_to_crawl:
 			self.crawled_or_crawling.add(url)
+			self.in_flight.add(url)
 			task = event_loop.run_in_executor(executor, self.__crawl, url)
+			task.add_done_callback(lambda t, u=url: self.in_flight.discard(u))
 			crawl_tasks.append(task)
 
 		logging.debug('waiting on all crawl tasks to complete')
@@ -231,10 +268,31 @@ class Crawler:
 		# Image sitemap enabled ?
 		image_list = ""
 		if self.images:
+			# Search for <figure> blocks so a <figcaption> can be matched back
+			# to the <img> it describes, keyed by the image's raw src attribute.
+			image_captions = {}
+			for figure_content in self.figureregex.findall(msg):
+				figcaption_match = self.figcaptionregex.search(figure_content)
+				img_match = self.imageregex.search(figure_content)
+				if not figcaption_match or not img_match:
+					continue
+				src_match = self.imagesrcregex.search(img_match.group(1))
+				if not src_match:
+					continue
+				caption = self.tagstripregex.sub(b'', figcaption_match.group(1))
+				caption = caption.decode("utf-8", errors="ignore").strip()
+				if caption:
+					image_captions[src_match.group(1)] = caption
+
 			# Search for images in the current page.
 			images = self.imageregex.findall(msg)
-			for image_link in list(set(images)):
-				image_link = image_link.decode("utf-8", errors="ignore")
+			for image_attrs in list(set(images)):
+				src_match = self.imagesrcregex.search(image_attrs)
+				if not src_match:
+					continue
+
+				raw_src = src_match.group(1)
+				image_link = raw_src.decode("utf-8", errors="ignore")
 
 				# Ignore link starting with data:
 				if image_link.startswith("data:"):
@@ -258,12 +316,24 @@ class Crawler:
 				if image_link_parsed.netloc != self.target_domain:
 					continue
 
+				# Take the title from the title attribute, falling back to alt
+				title_match = self.imagetitleregex.search(image_attrs)
+				alt_match = self.imagealtregex.search(image_attrs)
+				title = ""
+				if title_match and title_match.group(1).strip():
+					title = title_match.group(1).decode("utf-8", errors="ignore").strip()
+				elif alt_match and alt_match.group(1).strip():
+					title = alt_match.group(1).decode("utf-8", errors="ignore").strip()
+
+				caption = image_captions.get(raw_src, "")
 
 				# Test if images as been already seen and not present in the
 				# robot file
 				if self.can_fetch(image_link):
 					logging.debug(f"Found image : {image_link}")
-					image_list = f"{image_list}<image:image><image:loc>{self.htmlspecialchars(image_link)}</image:loc></image:image>"
+					image_title = f"<image:title>{self.htmlspecialchars(title)}</image:title>" if title else ""
+					image_caption = f"<image:caption>{self.htmlspecialchars(caption)}</image:caption>" if caption else ""
+					image_list = f"{image_list}<image:image><image:loc>{self.htmlspecialchars(image_link)}</image:loc>{image_title}{image_caption}</image:image>"
 
 		# Only add to sitemap URLs with same domain as the site being indexed
 		if url.netloc == self.target_domain:
@@ -371,6 +441,88 @@ class Crawler:
 
 			self.urls_to_crawl.add(link)
 
+	def _handle_interrupt(self, signum, frame):
+		logging.error("Interrupted, saving progress to the output file before exit...")
+		self.write_progress_to_output()
+		sys.exit(1)
+
+	def write_progress_to_output(self):
+		# Snapshot of everything crawled so far, written straight to --output
+		# so it doubles as the resume source next time --resume is used. No
+		# separate checkpoint file to keep in sync or clean up.
+		#
+		# The plain <url> entries alone aren't enough to resume correctly:
+		# they only record pages that finished crawling, not the pending
+		# frontier (urls_to_crawl/in_flight) still waiting to be fetched.
+		# Without that frontier, a resumed crawl would only find brand new
+		# links reachable from pages it hasn't visited yet, since every link
+		# to an already-crawled page is (rightly) skipped as a duplicate --
+		# so anything only reachable through a page that was mid-fetch (or
+		# still queued) at save time would silently never get crawled. So
+		# the frontier is stashed as an XML comment, which real sitemap
+		# consumers ignore, right before the closing tag.
+		if not self.output:
+			return
+		pending_urls = self.urls_to_crawl | self.in_flight
+		try:
+			with open(self.output, 'w') as output_file:
+				print(config.xml_header, file=output_file)
+				for url_string in self.url_strings_to_output:
+					print(url_string, file=output_file)
+				if pending_urls:
+					print("<!--PENDING-URLS:" + "\n".join(pending_urls) + "-->", file=output_file)
+				print(config.xml_footer, file=output_file)
+			logging.debug(f"Saved progress to {self.output}")
+		except Exception as e:
+			logging.error(f"Could not save progress to {self.output}: {e}")
+
+	def load_progress_from_output(self):
+		if not os.path.exists(self.output):
+			return
+		try:
+			with open(self.output, 'r') as output_file:
+				content = output_file.read()
+		except Exception as e:
+			logging.error(f"Could not read {self.output} to resume, starting fresh: {e}")
+			return
+
+		url_blocks = re.findall('<url>.*?</url>', content, re.DOTALL)
+		for url_block in url_blocks:
+			loc_match = re.search('<loc>(.*?)</loc>', url_block)
+			if not loc_match:
+				continue
+			self.url_strings_to_output.append(url_block)
+			self.crawled_or_crawling.add(self.html_unescape(loc_match.group(1)))
+
+		pending_match = re.search(r'<!--PENDING-URLS:(.*?)-->', content, re.DOTALL)
+		if pending_match:
+			pending_urls = {url for url in pending_match.group(1).split("\n") if url}
+			self.urls_to_crawl |= pending_urls
+			self.crawled_or_crawling -= pending_urls
+
+		if not url_blocks and not pending_match:
+			return
+
+		logging.info(
+			f"Resumed {len(self.url_strings_to_output)} previously crawled url(s) "
+			f"and {len(self.urls_to_crawl)} pending url(s) from {self.output}"
+		)
+
+	def dedupe_url_strings_to_output(self):
+		# Resuming re-crawls urls that were in_flight when progress was last
+		# saved (their own outgoing links may not have been discovered yet),
+		# which can add a second <url> entry for a page already written to
+		# url_strings_to_output. Keep the most recent entry for each loc.
+		locs_seen = {}
+		order = []
+		for url_string in self.url_strings_to_output:
+			loc_match = re.search('<loc>(.*?)</loc>', url_string)
+			key = loc_match.group(1) if loc_match else url_string
+			if key not in locs_seen:
+				order.append(key)
+			locs_seen[key] = url_string
+		self.url_strings_to_output = [locs_seen[key] for key in order]
+
 	def write_sitemap_output(self):
 		are_multiple_sitemap_files_required = \
 			len(self.url_strings_to_output) > self.MAX_URLS_PER_SITEMAP
@@ -389,7 +541,8 @@ class Crawler:
 			self.write_single_sitemap()
 
 	def write_single_sitemap(self):
-		self.write_sitemap_file(self.output_file, self.url_strings_to_output)
+		with open(self.output, 'w') as output_file:
+			self.write_sitemap_file(output_file, self.url_strings_to_output)
 
 	def write_index_and_sitemap_files(self):
 		sitemap_index_filename, sitemap_index_extension = os.path.splitext(self.output)
@@ -407,12 +560,12 @@ class Crawler:
 			self.write_subset_of_urls_to_sitemap(sitemap_filename, i * self.MAX_URLS_PER_SITEMAP)
 
 	def write_sitemap_index(self, sitemap_filenames):
-		sitemap_index_file = self.output_file
-		print(config.sitemapindex_header, file=sitemap_index_file)
-		for sitemap_filename in sitemap_filenames:
-			sitemap_url = urlunsplit([self.scheme, self.target_domain, sitemap_filename, '', ''])
-			print("<sitemap><loc>" + sitemap_url + "</loc>""</sitemap>", file=sitemap_index_file)
-		print(config.sitemapindex_footer, file=sitemap_index_file)
+		with open(self.output, 'w') as sitemap_index_file:
+			print(config.sitemapindex_header, file=sitemap_index_file)
+			for sitemap_filename in sitemap_filenames:
+				sitemap_url = urlunsplit([self.scheme, self.target_domain, sitemap_filename, '', ''])
+				print("<sitemap><loc>" + sitemap_url + "</loc>""</sitemap>", file=sitemap_index_file)
+			print(config.sitemapindex_footer, file=sitemap_index_file)
 
 	def write_subset_of_urls_to_sitemap(self, filename, index):
 		# Writes a maximum of self.MAX_URLS_PER_SITEMAP urls to a sitemap file
@@ -517,6 +670,10 @@ class Crawler:
 	@staticmethod
 	def htmlspecialchars(text):
 		return text.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+
+	@staticmethod
+	def html_unescape(text):
+		return text.replace("&gt;", ">").replace("&lt;", "<").replace("&quot;", '"').replace("&amp;", "&")
 
 	def make_report(self):
 		print ("Number of found URL : {0}".format(self.nb_url))

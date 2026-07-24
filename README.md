@@ -38,6 +38,10 @@ Read a config file to set parameters:
 
 More informations here https://support.google.com/webmasters/answer/178636?hl=en
 
+When enabled, each image's `title` (falling back to `alt` if there is no `title`) is
+added as `<image:title>`, and if the image sits inside a `<figure>` with a `<figcaption>`,
+that caption is added as `<image:caption>`.
+
   ```
   $ python main.py --domain https://blog.lesite.us --output sitemap.xml --images
   ```
@@ -106,6 +110,12 @@ $ python3 main.py --domain https://blog.lesite.us --auth
 ***Sitemaps with over 50,000 URLs should be split into an index file that points to sitemap files that each contain 50,000 URLs or fewer.  Outputting as an index requires specifying an output file.  An index will only be output if a crawl has more than 50,000 URLs:***
 ```
 $ python3 main.py --domain https://blog.lesite.us --as-index --output sitemap.xml
+```
+
+#### Resume an interrupted crawl
+***Large crawls can take a long time and may get interrupted (Ctrl+C, a crash, a network drop). Pass `--resume` to periodically save crawl progress into `--output` itself, including on interrupt, instead of a separate file. Re-running the exact same command afterwards continues from that file instead of starting over:***
+```
+$ python3 main.py --domain https://blog.lesite.us --output sitemap.xml --resume
 ```
 
 ## Docker usage
