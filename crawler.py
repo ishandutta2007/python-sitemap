@@ -9,6 +9,7 @@ import re
 from collections import defaultdict
 from copy import copy
 from datetime import datetime
+from urllib.error import HTTPError
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -438,7 +439,25 @@ class Crawler:
 		robots_url = urljoin(self.domain, "robots.txt")
 		self.rp = RobotFileParser()
 		self.rp.set_url(robots_url)
-		self.rp.read()
+
+		# Fetch robots.txt with the same User-Agent used for crawling.
+		# RobotFileParser.read() uses urlopen() without a custom header, so
+		# it sends the default "Python-urllib/x.y" User-Agent, which some
+		# sites block (403) as a generic bot signature. That causes
+		# RobotFileParser to set disallow_all, blocking every discovered
+		# link even though the site's robots.txt actually allows crawling.
+		try:
+			request = Request(robots_url, headers={"User-Agent": config.crawler_user_agent})
+			response = urlopen(request)
+			raw = response.read()
+			self.rp.parse(raw.decode("utf-8").splitlines())
+		except HTTPError as err:
+			if err.code in (401, 403):
+				self.rp.disallow_all = True
+			elif 400 <= err.code < 500:
+				self.rp.allow_all = True
+		except Exception as e:
+			logging.debug(f"Could not fetch robots.txt: {e}")
 
 	def can_fetch(self, link):
 		try:
