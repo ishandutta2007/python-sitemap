@@ -87,7 +87,7 @@ class Crawler:
 				 report=False ,domain="", exclude=[], skipext=[], drop=[],
 				 debug=False, verbose=False, images=False, videos=False, auth=False, as_index=False,
 				 fetch_iframes=False, sort_alphabetically=True, user_agent='*', resume=False,
-				 respect_noindex=True, respect_canonical=True, hreflang=False):
+				 respect_noindex=True, respect_canonical=True, hreflang=True):
 		self.num_workers   = num_workers
 		self.parserobots   = parserobots
 		self.user_agent    = user_agent
